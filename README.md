@@ -1,119 +1,90 @@
 # claude-code-memory-surface
 
-> Per-message proactive memory surfacing for Claude Code — using `UserPromptSubmit` hook + transcript-based dedup.
+> 让记忆主动找到你，而不是等你想起来去找它。
 
-English | [中文](README_zh.md)
+中文 | [English](README_en.md)
 
-## What this is
+## 解决什么问题
 
-When you talk to Claude Code, the model only "remembers" what's in its current context window. Memory MCP servers (like [Ombre-Brain](https://github.com/P0luz/Ombre-Brain)) solve part of this — they store memories durably and let the model retrieve them via tool calls. But there's still a gap:
+Claude Code 的记忆类 MCP server 都有同一个前提：**模型得自己决定什么时候去搜记忆**。如果它没意识到该搜，相关的上下文就一直埋着。
 
-**The model has to know to call the retrieval tool.** If it doesn't actively think "I should search memory now," relevant context stays hidden.
+已经有不少项目（[claude-mem](https://github.com/thedotmack/claude-mem)、[ClawMem](https://github.com/yoloshii/ClawMem) 等）通过 `UserPromptSubmit` hook 解决了这个问题——在每条消息发出时自动做一次语义搜索，把相关记忆注入到上下文里。
 
-This project closes that gap: a Claude Code `UserPromptSubmit` hook that, on every user message, runs a semantic search and pushes the most relevant chunks into the model's context **before** the model starts responding. No tool call required — the relevant memory is just *there* when the model wakes up to your message.
+本项目也是这个思路，但在去重机制上做了不同的选择：**直接读 Claude Code 的 session transcript 来判断哪些内容已经推过**，不维护单独的状态文件。
 
 ```
-You type a message
+你发消息
   ↓
-UserPromptSubmit hook fires (before Claude sees your message)
+UserPromptSubmit hook 触发（模型还没看到你的消息）
   ↓
-Hook embeds your message → runs semantic search against memory db
+hook 对你的消息做 embedding → 在记忆库里语义搜索
   ↓
-Top relevant chunks (filtered by score + dedup) injected into context
+最相关的片段（经过打分和去重）注入上下文
   ↓
-Claude reads your message *and* the surfaced memories together
+模型同时读到你的消息和浮现的记忆
 ```
 
-## The novel bit
+## 基于 transcript 的去重
 
-Almost all memory MCP servers (Ombre-Brain, mem0, letta, etc.) make the **model** responsible for memory retrieval. This project makes **the platform** responsible.
+这是本项目和同类方案的主要区别。
 
-| Mechanism | Where it lives | Triggered by |
-|---|---|---|
-| Tool-based retrieval (everyone) | MCP tool the model calls | Model decides |
-| `SessionStart` hook (Ombre-Brain) | Claude Code hook | Session start, once |
-| **`UserPromptSubmit` hook (this project)** | Claude Code hook | **Every user message** |
+维护一个 `pushed_chunks.json` 之类的状态文件做去重，有两个容易出问题的地方：
 
-The other novel piece is **transcript-based dedup**. Instead of maintaining a separate state file (which gets out of sync when you rewind a message), the hook reads the Claude Code session transcript file directly and parses already-pushed chunk IDs from it. This means:
+1. **消息回退**：用户撤回了一条触发推送的消息，状态文件里还记着"这个片段推过了"，但它实际上已经不在上下文里了。下次相关消息来了 hook 会跳过——用户感觉记忆消失了。
+2. **超时清理**：如果状态文件按时间清理，但 Claude Code 的 session 可以持续好几天，在 session 中间清理会导致片段重复推送。
 
-- **Rewind-tolerant**: if you rewind a message, the hook automatically forgets it pushed those chunks (because they're no longer in transcript) and is willing to push them again.
-- **No state file**: nothing to clean up, nothing to corrupt.
-- **Briefing-aware**: the hook also detects full-memory references (e.g. `[5b4e983f]` from a briefing tool) and skips chunks of memories that were already pushed in full.
+本项目的做法是直接读 transcript 文件。Transcript 就是上下文的真实状态：在里面的就是推过的，不在的就是没推过的，包括那些被撤回的。不需要额外的状态文件，不需要清理，不会失效。
 
-## Status: this is 抛砖引玉 (a starting point, not a finished product)
+hook 用两个正则来识别已推送的内容：
+- `\[(\w{6,}_\d+)\]`：匹配 hook 自己推过的片段（格式 `[memory-id_chunk-index]`）
+- `\[([a-f0-9]{8})\]`：匹配其他工具推过的完整记忆引用（如果你的记忆系统有类似 briefing 的功能，可以避免重复推送；没有的话这条规则不会匹配到任何东西，不影响使用）
 
-**The hook's tunables — `KEYWORDS`, `SCORE_THRESHOLD`, `MIN_LEN_TRIGGER` — are optimized for one specific person's conversation style. Yours will be different.**
+## 定位
 
-The same goes for the reference memory MCP server: its schema (deep / daily / diary / memo categories, valence/arousal tags, piecewise decay curve) is one specific take. Your relationship with Claude Code, your topics, your cadence — all different.
+**这是一个起点，不是一个成品。**
 
-This repo is meant as a working example to fork and customize. The README explains the architecture clearly enough that you can ask your own Claude Code to help you adapt it. **Don't expect plug-and-play** — expect a starting point.
+每个人的记忆系统都不一样。hook 里的触发关键词、相似度阈值、消息长度门槛都是针对一个人的对话习惯调出来的。附带的 memory MCP server 是一个最小化的参考实现——只有写入、读取、搜索这几个基本功能，方便你跑起来验证 hook 的效果。实际使用中你大概率会换成自己的记忆后端。
 
-## Repo layout
+把它当作一个可以 fork 来改的模板就好。
+
+## 仓库结构
 
 ```
 claude-code-memory-surface/
 ├── hook/
-│   └── memory_surface.py         ← the novel contribution: UserPromptSubmit hook
+│   └── memory_surface.py         ← 核心：UserPromptSubmit hook 脚本
 ├── reference/
-│   └── server.py                 ← reference memory MCP server (schema inspired by Ombre-Brain)
+│   └── server.py                 ← 最小化的 memory MCP server（参考实现）
 ├── scripts/
-│   ├── backfill_chunks.py        ← chunk + embed existing memories (one-time)
-│   └── backfill_retry.py         ← retry NULL embeddings (rate-limit recovery)
+│   ├── backfill_chunks.py        ← 给已有记忆补切片和 embedding（一次性）
+│   └── backfill_retry.py         ← 重试失败的 embedding（应对限频）
 ├── systemd/
 │   └── memory-mcp.service.example
 ├── .env.example
 ├── .gitignore
-├── LICENSE                       ← MIT
-└── README.md
+└── LICENSE                       ← MIT
 ```
 
-## Setup
+## 安装
 
-### Prerequisites
+### 前提
 
-- A Linux server (1GB RAM is plenty) for the memory MCP server
-- Python 3.10+ with `numpy`
-- A free Gemini API key from <https://aistudio.google.com/apikey>
-- Claude Code installed locally
+- 你已经有一个支持 `semantic_search` 的记忆 MCP server（自己搭的或者用 Ombre-Brain 等现成方案都行）
+- 本地装好 Claude Code
 
-### 1. Deploy the reference memory MCP server (skip if you have your own)
+> 如果还没有记忆后端，仓库里附了一个最小化的参考实现（`reference/server.py`），需要 Python 3.10+ / numpy / Gemini API key，具体配置见 `.env.example`。
+
+### 1. 安装 hook
 
 ```bash
-git clone https://github.com/<your-username>/claude-code-memory-surface.git
-cd claude-code-memory-surface
-cp .env.example .env
-# Edit .env — set MCP_TOKEN (any random hex), GEMINI_API_KEY
-python3 reference/server.py    # runs on port 3458
-```
-
-For a permanent setup, copy `systemd/memory-mcp.service.example` to `/etc/systemd/system/memory-mcp.service`, edit the paths, and `systemctl enable --now memory-mcp`.
-
-If you want it accessible over HTTPS, put nginx in front of port 3458.
-
-### 2. Add the MCP server to Claude Code
-
-In `~/.claude.json` (or via `claude mcp add`):
-
-```json
-{
-  "mcpServers": {
-    "memory": {
-      "type": "sse",
-      "url": "http://localhost:3458/<your_MCP_TOKEN>/sse"
-    }
-  }
-}
-```
-
-### 3. Install the hook
-
-```bash
-mkdir -p ~/.claude/hooks
-cp hook/memory_surface.py ~/.claude/hooks/
+git clone https://github.com/Qizhan7/claude-code-memory-surface.git
+cp claude-code-memory-surface/hook/memory_surface.py ~/.claude/hooks/
 chmod +x ~/.claude/hooks/memory_surface.py
 ```
 
-Add to `~/.claude/settings.json`:
+### 2. 配置 hook
+
+在 `~/.claude/settings.json` 里加上（把 URL 换成你自己的记忆后端地址）：
 
 ```json
 {
@@ -123,7 +94,7 @@ Add to `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MEMORY_MCP_URL=http://localhost:3458/<your_MCP_TOKEN> python3 ~/.claude/hooks/memory_surface.py"
+            "command": "MEMORY_MCP_URL=<你的记忆后端URL> python3 ~/.claude/hooks/memory_surface.py"
           }
         ]
       }
@@ -132,58 +103,31 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-### 4. Test the hook standalone
+### 3. 测试
 
 ```bash
-echo '{"prompt":"<some query that should match memories you have>"}' \
-  | MEMORY_MCP_URL=http://localhost:3458/<your_MCP_TOKEN> python3 ~/.claude/hooks/memory_surface.py
+echo '{"prompt":"某个应该能匹配到记忆的句子"}' \
+  | MEMORY_MCP_URL=<你的记忆后端URL> python3 ~/.claude/hooks/memory_surface.py
 ```
 
-You should see `[memory-surface] auto-surfaced relevant chunks:` followed by chunks. If you see nothing, try a longer query or one containing a keyword from the `KEYWORDS` list.
+正常的话会输出 `[memory-surface] auto-surfaced relevant chunks:` 和匹配到的片段。
 
-### 5. (Optional) Backfill embeddings for existing memories
+## 参数调整
 
-If you already have memories in the database without embeddings:
+hook 脚本里有几个参数你大概率想改：
 
-```bash
-MEMORY_DB_PATH=./memories.db GEMINI_API_KEY=<your_key> python3 scripts/backfill_chunks.py
-```
-
-If you hit Gemini rate limits mid-run, use the retry script:
-
-```bash
-MEMORY_DB_PATH=./memories.db GEMINI_API_KEY=<your_key> python3 scripts/backfill_retry.py
-```
-
-## How to customize for your style
-
-These are the things you'll probably want to change.
-
-### Hook script (`hook/memory_surface.py`)
-
-| Tunable | What it controls | How to tune |
+| 参数 | 作用 | 怎么调 |
 |---|---|---|
-| `KEYWORDS` | Words that indicate "I'm querying memory" — bypass length check and trigger | Add words you naturally use when referencing past stuff. The defaults are Chinese + a few English. |
-| `SCORE_THRESHOLD` | Minimum cosine similarity to push a chunk | Higher = stricter (less noise, more misses). 0.7 worked well for me; 0.65 if your queries are vague, 0.75 if you want very tight matching. |
-| `MIN_LEN_TRIGGER` | Below this length, skip unless keyword match | 6 chars catches "嗯", "ok", "haha"; raise to 15 for English-heavy use. |
-| `MAX_CHUNKS` | Max chunks to push per message | 2 is conservative; 3-4 if your memory is heavily chunked. |
+| `KEYWORDS` | 触发关键词——消息里含这些词就无视长度直接搜 | 加上你平时提到过去的事时常用的表达。默认偏中文。 |
+| `SCORE_THRESHOLD` | 推送片段的最低相似度 | 越高越严格。默认 0.7；模糊查询多降到 0.65，要求精准调到 0.75。 |
+| `MIN_LEN_TRIGGER` | 消息短于这个长度就跳过（除非命中关键词） | 默认 6，过滤掉"嗯""好"这些。英文为主的话提到 15。 |
+| `MAX_CHUNKS` | 单条消息最多推几个片段 | 默认 2。片段多的话可以开到 3-4。 |
 
-### Memory schema (`reference/server.py`)
+## 接入自己的记忆后端
 
-| Decision | Default | Alternatives |
-|---|---|---|
-| Categories | `deep` / `daily` / `diary` / `memo` | Maybe just `notes` / `facts`. Or topic-based: `work` / `personal` / `tech`. |
-| Decay curve | piecewise: short-term recency-weighted, long-term emotion-weighted | Linear / exponential / no decay. |
-| Chunking strategy | `## headers` → `【】 sections` → paragraphs (max 600 chars) | Tune for the markdown style you actually use. |
-| Embedding model | `gemini-embedding-001` (3072-dim, free tier) | Any model with an OpenAI-compatible embeddings endpoint. |
+hook 唯一的要求是你的 MCP server 暴露一个 `semantic_search` 工具，接口格式如下：
 
-The point is: **don't keep my decisions if they don't fit you.** Fork, change, redeploy.
-
-## Compatibility — using your own memory backend
-
-The hook only requires that your MCP server expose a `semantic_search` tool with this signature:
-
-**Request:**
+**请求：**
 ```json
 {
   "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -194,61 +138,29 @@ The hook only requires that your MCP server expose a `semantic_search` tool with
 }
 ```
 
-**Response (the `text` field is a JSON-encoded list of chunk objects):**
+**返回（`text` 字段是 JSON 编码的片段列表）：**
 ```json
 {
   "result": {
-    "content": [{"type": "text", "text": "[{\"chunk_text\": \"...\", \"parent_memory_id\": \"...\", \"chunk_index\": 0, \"score\": 0.74, \"category\": \"...\"}]"}]
+    "content": [{"type": "text", "text": "[{\"chunk_text\": \"...\", \"parent_memory_id\": \"...\", \"chunk_index\": 0, \"score\": 0.74}]"}]
   }
 }
 ```
 
-If you have a memory MCP server that already does chunk-level embedding (e.g. you can adapt Ombre-Brain), wrap its retrieval in a tool with this signature and the hook will work.
+只要你的记忆后端能包成这个接口，hook 就能直接用。附带的 `reference/server.py` 就是按这个接口写的最小实现，可以作为适配参考。
 
-## Architecture details
+## 已知限制
 
-### Why per-message hook beats tool-based retrieval
+- **Gemini 免费额度限频**比较严，实测 `gemini-embedding-001` 稳定在大约 75 次/分钟。短时间写很多大段记忆会撞 429，`backfill_retry.py` 有自适应退避处理。
+- **换 embedding 模型要全部重新生成**：片段表里存的是原始向量，没有标注用的是哪个模型。
 
-When retrieval is a tool the model calls, the model has to *decide* to call it — and that decision is unreliable. Models default to working with what's in context. If the user mentions "Joffy" and the model hasn't seen "Joffy" before, it will often respond ambiguously rather than search.
+## 同类项目
 
-A hook bypasses the decision entirely. By the time the model sees your message, the relevant chunks are already in its context. The model just reads them like any other context.
+- [claude-mem](https://github.com/thedotmack/claude-mem) — UserPromptSubmit + ChromaDB，思路最接近
+- [ClawMem](https://github.com/yoloshii/ClawMem) — 功能最丰富，BM25 + 向量 + 重排序 + 意图分类
+- [claude-hooks](https://github.com/mann1x/claude-hooks) — UserPromptSubmit + Qdrant + 注意力衰减
+- [Ombre-Brain](https://github.com/P0luz/Ombre-Brain) — SessionStart hook 推送 + 完整的记忆 MCP server
 
-### Why transcript-based dedup beats state files
+## 许可
 
-Naive dedup keeps a `pushed_chunks.json` file. Two failure modes:
-
-1. **Rewind**: user rewinds a message that triggered a push. The state file still says "this chunk was pushed" but it's no longer in context. Hook will skip pushing again on the next relevant message → user sees no recall.
-2. **TTL-based reset**: state file is wiped after N hours of inactivity. But Claude Code sessions can last 3-4 days, so wiping mid-session re-pushes things → noise.
-
-Reading the transcript file directly fixes both. The transcript is the actual source of truth for what's in the model's context. Anything in there is "pushed"; anything not in there is "not pushed" — including stuff that was rewound out.
-
-The hook uses two regex patterns:
-- `\[(\w{6,}_\d+)\]` matches chunks pushed by the hook itself (format `[memory-id_chunk-index]`)
-- `\[([a-f0-9]{8})\]` matches full memory IDs from briefing-style tools (format `[memory-id]`)
-
-Anything matching the second pattern is treated as "the entire memory is already in context" — all chunks of that memory are skipped.
-
-### Quality gates
-
-Embedding-based search returns "similar" chunks, not necessarily "relevant" ones. Common phrases like "how are you doing recently" pull up anything with a "recent state" theme regardless of subject. To filter:
-
-- **Score threshold (0.7)**: weak matches (typically the noisy false positives) live in the 0.6-0.7 band. Cutting at 0.7 cleanly separates them from real matches (0.7+).
-- **Length gating**: `"嗯"` and `"ok"` get filtered before any API call (saves rate limit + latency).
-- **Keyword whitelist**: explicit history-querying words ("还记得", "上次", "remember") bypass length gating.
-
-## Known limits
-
-- **Gemini free-tier rate limits** are strict for `gemini-embedding-001` — observed ~75 RPM stable. Heavy bursts (writing many large memories at once) will hit 429. The `backfill_retry.py` script handles this with adaptive backoff.
-- **No multimodal memory yet**: images, voice, etc. aren't embedded.
-- **No cross-memory linking**: the chunks table doesn't track explicit relations between memories. Could be added in a future iteration.
-- **Embedding model migration is destructive**: changing `EMBED_MODEL` requires re-embedding everything (the chunks store raw float32 BLOBs, not model-tagged vectors).
-
-## Prior art / inspiration
-
-- [Ombre-Brain](https://github.com/P0luz/Ombre-Brain) by P0luz — the schema design (valence/arousal labels, piecewise decay, chunk-level embedding) is directly inspired by this project. Ombre-Brain implements `SessionStart`-hook-based surfacing and is a great Memory MCP server in its own right. The novel direction in `claude-code-memory-surface` is the per-message `UserPromptSubmit` hook + transcript-based dedup, not the memory schema itself.
-- [mem0](https://github.com/mem0ai/mem0) — provider-agnostic memory layer. Different abstraction (more like a structured-fact extractor with vector backend).
-- [letta (memgpt)](https://github.com/letta-ai/letta) — full agent framework with tiered memory. Different scope.
-
-## License
-
-MIT.
+MIT
