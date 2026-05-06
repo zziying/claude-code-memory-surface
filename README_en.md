@@ -75,7 +75,7 @@ claude-code-memory-surface/
 ### 1. Install the hook
 
 ```bash
-git clone https://github.com/Qizhan7/claude-code-memory-surface.git
+git clone https://github.com/zziying/claude-code-memory-surface.git
 cp claude-code-memory-surface/hook/memory_surface.py ~/.claude/hooks/
 chmod +x ~/.claude/hooks/memory_surface.py
 ```
