@@ -1,0 +1,28 @@
+# Sensitive
+.env
+
+# Database files
+*.db
+*.db.bak.*
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Backups
+*.bak
+*.bak.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

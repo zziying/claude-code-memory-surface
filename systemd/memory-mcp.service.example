@@ -1,0 +1,15 @@
+[Unit]
+Description=Memory MCP Server (claude-code-memory-surface reference)
+After=network.target
+
+[Service]
+Type=simple
+# All config (MCP_TOKEN, GEMINI_API_KEY, MEMORY_DB_PATH, MEMORY_MCP_PORT) goes in .env
+EnvironmentFile=/path/to/claude-code-memory-surface/.env
+ExecStart=/usr/bin/python3 /path/to/claude-code-memory-surface/reference/server.py
+Restart=always
+RestartSec=3
+WorkingDirectory=/path/to/claude-code-memory-surface
+
+[Install]
+WantedBy=multi-user.target
