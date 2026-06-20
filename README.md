@@ -1,4 +1,4 @@
-# claude-code-memory-surface
+# claude-code-memory-surface v3
 
 > 让记忆主动找到你，而不是等你想起来去找它。
 
@@ -6,73 +6,56 @@
 
 ## 解决什么问题
 
-Claude Code 的记忆类 MCP server 都有同一个前提：**模型得自己决定什么时候去搜记忆**。如果它没意识到该搜，相关的上下文就一直埋着。
+外部记忆系统（[Ombre Brain](https://github.com/P0luz/Ombre-Brain)、自建 MCP 等）都能**存**记忆，但检索是被动的——模型必须知道该搜什么才会搜。
 
-已经有不少项目（[claude-mem](https://github.com/thedotmack/claude-mem)、[ClawMem](https://github.com/yoloshii/ClawMem) 等）通过 `UserPromptSubmit` hook 解决了这个问题——在每条消息发出时自动做一次语义搜索，把相关记忆注入到上下文里。
+**问题是：context 压缩（compact）删掉的不只是记忆内容，而是"知道自己有过这段记忆"的元记忆。** 你不记得自己有过一段经历，就不会想到去搜，记忆就永远躺在库里不被触发。
 
-本项目也是这个思路，但在去重机制上做了不同的选择：**直接读 Claude Code 的 session transcript 来判断哪些内容已经推过**，不维护单独的状态文件。
+本项目用 Claude Code 的 `UserPromptSubmit` hook，在**每条消息发送时**自动跑一次语义搜索 + LLM 重排序，把相关记忆主动推进上下文。不需要模型主动搜，不需要人类提醒"你去查一下"。
+
+## v3 vs v1
+
+v1 只做 cosine 相似度 + 手调阈值，噪音多、命中率差。
+
+v3 做了四个核心改进：
+
+| 改进 | 问题 | 解法 |
+|------|------|------|
+| **三档 Intent Gate** | "嗯""ok"这种不该触发搜索 | SKIP / TRIGGER / LIGHT 三档分流，节省 API 调用 |
+| **LLM Reranker** | cosine 分高不代表真的相关 | 用 DeepSeek/OpenAI 等 LLM 判断"缺了这条记忆回答会不会变差" |
+| **对话上下文** | "心痛"可能是撒娇不是真难过 | 从 transcript 提取最近 3 轮对话喂给 reranker 判断语境 |
+| **Event 优先** | 碎片太多，信息密度低 | 支持 event（多条记忆聚合的概览），优先推送 |
+
+## 架构
 
 ```
-你发消息
+用户发消息
   ↓
-UserPromptSubmit hook 触发（模型还没看到你的消息）
+UserPromptSubmit hook 触发
   ↓
-hook 对你的消息做 embedding → 在记忆库里语义搜索
+1. Intent Gate: SKIP / TRIGGER / LIGHT
   ↓
-最相关的片段（经过打分和去重）注入上下文
+2. 双路搜索: event + general (并行)
   ↓
-模型同时读到你的消息和浮现的记忆
+3. 强过滤: 去重(transcript) + archived + deep + resolved
+  ↓
+4. [LIGHT] Cosine 闸门: 最高分 < 0.65 → 跳过 reranker
+  ↓
+5. LLM Reranker: 结合对话上下文打分 (0/1/2)
+  ↓
+6. 注入: max 1 event + 1 fragment → 上下文开头
 ```
 
 ## 基于 transcript 的去重
 
-这是本项目和同类方案的主要区别。
-
-维护一个 `pushed_chunks.json` 之类的状态文件做去重，有两个容易出问题的地方：
-
-1. **消息回退**：用户撤回了一条触发推送的消息，状态文件里还记着"这个片段推过了"，但它实际上已经不在上下文里了。下次相关消息来了 hook 会跳过——用户感觉记忆消失了。
-2. **超时清理**：如果状态文件按时间清理，但 Claude Code 的 session 可以持续好几天，在 session 中间清理会导致片段重复推送。
-
-本项目的做法是直接读 transcript 文件。Transcript 就是上下文的真实状态：在里面的就是推过的，不在的就是没推过的，包括那些被撤回的。不需要额外的状态文件，不需要清理，不会失效。
-
-hook 用两个正则来识别已推送的内容：
-- `\[(\w{6,}_\d+)\]`：匹配 hook 自己推过的片段（格式 `[memory-id_chunk-index]`）
-- `\[([a-f0-9]{8})\]`：匹配其他工具推过的完整记忆引用（如果你的记忆系统有类似 briefing 的功能，可以避免重复推送；没有的话这条规则不会匹配到任何东西，不影响使用）
-
-## 定位
-
-**这是一个起点，不是一个成品。**
-
-每个人的记忆系统都不一样。hook 里的触发关键词、相似度阈值、消息长度门槛都是针对一个人的对话习惯调出来的。附带的 memory MCP server 是一个最小化的参考实现——只有写入、读取、搜索这几个基本功能，方便你跑起来验证 hook 的效果。实际使用中你大概率会换成自己的记忆后端。
-
-把它当作一个可以 fork 来改的模板就好。
-
-## 仓库结构
-
-```
-claude-code-memory-surface/
-├── hook/
-│   └── memory_surface.py         ← 核心：UserPromptSubmit hook 脚本
-├── reference/
-│   └── server.py                 ← 最小化的 memory MCP server（参考实现）
-├── scripts/
-│   ├── backfill_chunks.py        ← 给已有记忆补切片和 embedding（一次性）
-│   └── backfill_retry.py         ← 重试失败的 embedding（应对限频）
-├── systemd/
-│   └── memory-mcp.service.example
-├── .env.example
-├── .gitignore
-└── LICENSE                       ← MIT
-```
+这是本项目的核心设计。直接读 Claude Code 的 session transcript 来判断哪些记忆已经在上下文里，不维护单独的状态文件。Transcript 是上下文的真实来源——消息回退后自动同步，不会出现"状态文件说推过但实际已不在上下文里"的问题。
 
 ## 安装
 
 ### 前提
 
-- 你已经有一个支持 `semantic_search` 的记忆 MCP server（自己搭的或者用 Ombre-Brain 等现成方案都行）
 - 本地装好 Claude Code
-
-> 如果还没有记忆后端，仓库里附了一个最小化的参考实现（`reference/server.py`），需要 Python 3.10+ / numpy / Gemini API key，具体配置见 `.env.example`。
+- 有一个支持语义搜索的记忆 MCP server（[Ombre Brain](https://github.com/P0luz/Ombre-Brain)、自建、或用仓库里的参考实现）
+- （可选）LLM API key 用于 reranker（没有的话退化为 v1 的 cosine 阈值模式）
 
 ### 1. 安装 hook
 
@@ -82,9 +65,9 @@ cp claude-code-memory-surface/hook/memory_surface.py ~/.claude/hooks/
 chmod +x ~/.claude/hooks/memory_surface.py
 ```
 
-### 2. 配置 hook
+### 2. 配置 Claude Code
 
-在 `~/.claude/settings.json` 里加上（把 URL 换成你自己的记忆后端地址）：
+在 `~/.claude/settings.json` 里加上：
 
 ```json
 {
@@ -94,7 +77,7 @@ chmod +x ~/.claude/hooks/memory_surface.py
         "hooks": [
           {
             "type": "command",
-            "command": "MEMORY_MCP_URL=<你的记忆后端URL> python3 ~/.claude/hooks/memory_surface.py"
+            "command": "MEMORY_MCP_URL='你的记忆后端URL' RERANKER_API_KEY='你的LLM API key' python3 ~/.claude/hooks/memory_surface.py"
           }
         ]
       }
@@ -103,29 +86,41 @@ chmod +x ~/.claude/hooks/memory_surface.py
 }
 ```
 
+环境变量也可以写在 `.env` 文件里或系统环境中，不一定要内联。
+
 ### 3. 测试
 
 ```bash
-echo '{"prompt":"某个应该能匹配到记忆的句子"}' \
-  | MEMORY_MCP_URL=<你的记忆后端URL> python3 ~/.claude/hooks/memory_surface.py
+echo '{"prompt":"你还记得上次我们聊了什么吗"}' \
+  | MEMORY_MCP_URL='你的URL' RERANKER_API_KEY='你的key' \
+  python3 ~/.claude/hooks/memory_surface.py
 ```
 
-正常的话会输出 `[memory-surface] auto-surfaced relevant chunks:` 和匹配到的片段。
+## 配置项
 
-## 参数调整
+所有参数通过环境变量配置，详见 `.env.example`。
 
-hook 脚本里有几个参数你大概率想改：
+### 核心参数
 
-| 参数 | 作用 | 怎么调 |
-|---|---|---|
-| `KEYWORDS` | 触发关键词——消息里含这些词就无视长度直接搜 | 加上你平时提到过去的事时常用的表达。默认偏中文。 |
-| `SCORE_THRESHOLD` | 推送片段的最低相似度 | 越高越严格。默认 0.7；模糊查询多降到 0.65，要求精准调到 0.75。 |
-| `MIN_LEN_TRIGGER` | 消息短于这个长度就跳过（除非命中关键词） | 默认 6，过滤掉"嗯""好"这些。英文为主的话提到 15。 |
-| `MAX_CHUNKS` | 单条消息最多推几个片段 | 默认 2。片段多的话可以开到 3-4。 |
+| 参数 | 作用 | 默认值 |
+|------|------|--------|
+| `MEMORY_MCP_URL` | 记忆 MCP server 地址 | （必填） |
+| `RERANKER_API_KEY` | LLM reranker API key | （空 = 退化为 cosine 阈值） |
+| `RERANKER_API_URL` | OpenAI 兼容 API 地址 | `https://api.deepseek.com/chat/completions` |
+| `RERANKER_MODEL` | reranker 模型 | `deepseek-chat` |
+| `USER_NAME` / `AI_NAME` | reranker prompt 里的角色名 | `user` / `assistant` |
 
-## 接入自己的记忆后端
+### 调参
 
-hook 唯一的要求是你的 MCP server 暴露一个 `semantic_search` 工具，接口格式如下：
+| 参数 | 作用 | 默认值 |
+|------|------|--------|
+| `LIGHT_COS_GATE` | LIGHT 模式下跳过 reranker 的 cosine 阈值 | `0.65` |
+| `RECALL_EXCLUDE` | Intent Gate 排除的复合词（逗号分隔） | `记忆库,记忆浮现,记忆系统` |
+| `RECALL_KW`（代码内） | 触发完整搜索的关键词列表 | 见代码，默认中英混合 |
+
+## 接入不同的记忆后端
+
+hook 唯一的要求是你的 MCP server 暴露一个搜索工具（默认名 `semantic_search`），接口格式：
 
 **请求：**
 ```json
@@ -133,33 +128,102 @@ hook 唯一的要求是你的 MCP server 暴露一个 `semantic_search` 工具�
   "jsonrpc": "2.0", "id": 1, "method": "tools/call",
   "params": {
     "name": "semantic_search",
-    "arguments": {"query": "...", "limit": 5}
+    "arguments": {"query": "...", "limit": 5, "no_track": true}
   }
 }
 ```
 
-**返回（`text` 字段是 JSON 编码的片段列表）：**
+**返回：**
 ```json
 {
   "result": {
-    "content": [{"type": "text", "text": "[{\"chunk_text\": \"...\", \"parent_memory_id\": \"...\", \"chunk_index\": 0, \"score\": 0.74}]"}]
+    "content": [{"type": "text", "text": "[{\"chunk_text\": \"...\", \"parent_memory_id\": \"...\", \"chunk_index\": 0, \"score\": 0.74, \"category\": \"fragment\"}]"}]
   }
 }
 ```
 
-只要你的记忆后端能包成这个接口，hook 就能直接用。附带的 `reference/server.py` 就是按这个接口写的最小实现，可以作为适配参考。
+### 接入 Ombre Brain
+
+Ombre Brain 的 `breath` 工具返回格式略有不同。你需要做一个简单的适配（把 breath 的返回值映射成上面的格式），或者写一个小的代理服务。具体适配方式取决于你的 OB 部署方式。
+
+如果你的搜索工具不叫 `semantic_search`，设置 `SEARCH_TOOL_NAME` 环境变量。
+
+## 使用不同的 LLM 做 reranker
+
+任何 OpenAI 兼容的 API 都可以：
+
+- **DeepSeek**（推荐，便宜）：`RERANKER_API_URL=https://api.deepseek.com/chat/completions`
+- **OpenAI**：`RERANKER_API_URL=https://api.openai.com/v1/chat/completions` + `RERANKER_MODEL=gpt-4o-mini`
+- **本地模型**（Ollama 等）：`RERANKER_API_URL=http://localhost:11434/v1/chat/completions` + `RERANKER_MODEL=your-model`
+
+不配 `RERANKER_API_KEY` 的话，hook 退化为 v1 行为（cosine ≥ 0.7 直接推送）。
+
+## Intent Gate 详解
+
+三档设计避免每条消息都调 LLM：
+
+- **SKIP**：空消息、噪音词（"嗯""好""哈哈"）、代码块、系统消息 → 不搜索
+- **TRIGGER**：含回忆关键词（"之前""上次""记得"等）→ 完整搜索 + rerank
+- **LIGHT**：其他消息 → 轻量搜索，cosine 最高分过阈值才调 reranker
+
+LIGHT 模式的 cosine 闸门（默认 0.65）是关键——它在"不浪费 reranker 调用"和"不漏掉相关记忆"之间取平衡。如果 reranker 调用成本不是问题，可以把 `LIGHT_COS_GATE` 调低。
+
+## Debug
+
+日志默认写在 `~/.claude/hooks/surface_debug.log`，记录每次调用的 Intent Gate 结果、搜索数量、过滤情况、reranker 打分。
+
+如果发现浮现质量不好（噪音多 / 该浮现的没浮现），看日志能快速定位是哪个环节出了问题。
+
+## 实际运行数据
+
+以下数据来自日常使用的 debug log（中文对话场景，记忆库约 500 条 fragment）：
+
+**Intent Gate 分流：**
+
+| 档位 | 占比 | 说明 |
+|------|------|------|
+| SKIP | ~12% | 噪音词、代码、系统消息，零延迟 |
+| LIGHT | ~79% | 普通消息，轻量搜索 |
+| TRIGGER | ~8% | 含回忆关键词，完整搜索 |
+
+**Reranker 过滤效果：**
+
+reranker 对候选记忆的打分分布：
+
+| 分数 | 占比 | 含义 |
+|------|------|------|
+| 0（无关） | ~82% | 被过滤掉 |
+| 1（沾边） | ~9% | 被过滤掉 |
+| 2（直接有用） | ~9% | 注入上下文 |
+
+reranker 过滤掉了九成候选，实际注入的基本都是语境相关的。
+
+**延迟：**
+
+| 路径 | 占比 | 延迟 |
+|------|------|------|
+| SKIP（Intent Gate 拦截） | ~12% | ~0ms |
+| Cosine gate 拦截（只搜索） | ~18% | ~1-2s |
+| 完整流程（含 reranker） | ~62% | P50 3.6s / P90 5.1s |
+
+延迟主要来自 LLM reranker API 调用。搜索本身 1-2 秒。不配 reranker 可以回到 v1 的亚秒级响应。
+
+**注入频率：**
+
+平均每条消息注入 0.24 条记忆——大部分消息不注入任何东西，只在真正相关时才推送。
 
 ## 已知限制
 
-- **Gemini 免费额度限频**比较严，实测 `gemini-embedding-001` 稳定在大约 75 次/分钟。短时间写很多大段记忆会撞 429，`backfill_retry.py` 有自适应退避处理。
-- **换 embedding 模型要全部重新生成**：片段表里存的是原始向量，没有标注用的是哪个模型。
+- **reranker 增加 2-4 秒延迟**：每条 TRIGGER/LIGHT 消息会多等几秒。如果不能接受，去掉 `RERANKER_API_KEY` 回到 v1 模式。
+- **event 支持依赖后端**：如果你的记忆后端没有 event 类型，event 搜索会返回空，hook 正常工作只是少了 event 优先的能力。
+- **Reranker prompt 是英文的**：即使你的对话是中文，prompt 用英文也能正常工作（DeepSeek/GPT 都支持）。如果想改成中文或其他语言，直接编辑脚本里的 `RERANK_PROMPT_CTX` 和 `RERANK_PROMPT_NO_CTX`。
 
 ## 同类项目
 
-- [claude-mem](https://github.com/thedotmack/claude-mem) — UserPromptSubmit + ChromaDB，思路最接近
-- [ClawMem](https://github.com/yoloshii/ClawMem) — 功能最丰富，BM25 + 向量 + 重排序 + 意图分类
+- [Ombre-Brain](https://github.com/P0luz/Ombre-Brain) — 完整的记忆 MCP server，有 hold/grow/breath/dream
+- [claude-mem](https://github.com/thedotmack/claude-mem) — UserPromptSubmit + ChromaDB
+- [ClawMem](https://github.com/yoloshii/ClawMem) — BM25 + 向量 + 重排序 + 意图分类
 - [claude-hooks](https://github.com/mann1x/claude-hooks) — UserPromptSubmit + Qdrant + 注意力衰减
-- [Ombre-Brain](https://github.com/P0luz/Ombre-Brain) — SessionStart hook 推送 + 完整的记忆 MCP server
 
 ## 许可
 
