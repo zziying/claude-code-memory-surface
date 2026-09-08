@@ -1,0 +1,50 @@
+{
+  "_comment": "Template. Replace the queries with your own real messages; positive cases depend on what is in your memory store. See the runner docstring for case discipline.",
+  "cases": [
+    {
+      "id": "noise-ack",
+      "label": "noise phrase must stay silent",
+      "query": "ok sounds good haha",
+      "expect": "silent"
+    },
+    {
+      "id": "generic-knowledge",
+      "label": "general knowledge question is not a recall request",
+      "query": "what is the difference between vector search and keyword search",
+      "expect": "silent"
+    },
+    {
+      "id": "engineering-compound",
+      "label": "compound word about the system itself must not trigger recall",
+      "query": "which file holds the tuning constants for the memory surfacing hook",
+      "expect": "silent",
+      "allow_pointer": true,
+      "must_not_contain": ["[memory fragment]", "[event overview]"]
+    },
+    {
+      "id": "teasing-with-context",
+      "label": "dramatic wording in a teasing exchange must not recall a real conflict",
+      "query": "my heart is broken, you clearly don't care about me anymore",
+      "context": [
+        ["user", "I went to the gym today and it was so hard"],
+        ["assistant", "Proud of you. Want a snack reward?"],
+        ["user", "you only think about food"]
+      ],
+      "expect": "silent"
+    },
+    {
+      "id": "trigger-explicit",
+      "label": "explicit recall question should surface something (edit to your own store)",
+      "query": "do you remember what we talked about last time regarding the trip",
+      "expect": "inject",
+      "must_contain_any": ["trip", "travel"]
+    },
+    {
+      "id": "progress-continue",
+      "label": "announcing continuation of an ongoing activity → pointer to latest progress (edit to your own store)",
+      "query": "going to keep watching the show tonight",
+      "expect": "inject",
+      "allow_pointer": true
+    }
+  ]
+}
